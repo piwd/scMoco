@@ -183,7 +183,7 @@ def scipy_sparse_to_torch_sparse(adj):
 def is_logged(adata):
     return (adata.X.max() < 30) and (adata.X.min() >= 0)
 
-def prepare_adata_for_gene2vec(adata_raw, ref_gene=None, n_features=3000, min_cells=None, min_genes=None):
+def prepare_adata_for_gene2vec(adata_raw, ref_gene=None, n_features=3000, min_cells=None, min_genes=None, hvg_flavor="seurat"):
     '''ref_gene: list of reference gene symbols.'''
     adata = adata_raw.copy()
     adata.var_names = adata.var_names.astype(str)
@@ -192,17 +192,18 @@ def prepare_adata_for_gene2vec(adata_raw, ref_gene=None, n_features=3000, min_ce
         sc.pp.filter_cells(adata, min_genes=min_genes)
     if min_cells is not None:
         sc.pp.filter_genes(adata, min_cells=min_cells)
-
+    
     sc.pp.normalize_total(adata)
     if not is_logged(adata):
         print('performing log-transform.')
         sc.pp.log1p(adata)
-
+    
     n = min(n_features, adata.X.shape[1])
     print(f'finding top {n} highly variable genes.')
+
     sc.pp.highly_variable_genes(
         adata,
-        flavor="seurat",
+        flavor=hvg_flavor,
         n_top_genes=n,
         subset=True,
         inplace=True,
@@ -229,8 +230,101 @@ def prepare_adata_for_gene2vec(adata_raw, ref_gene=None, n_features=3000, min_ce
 
     return adata_matched, valid_idx
 
+def find_top_features(
+    adata,
+    min_cutoff = None,
+    n_top = None,
+    inplace = False
+):
+    if inplace:
+        adata_out = adata
+    else:
+        adata_out = adata.copy()
+
+    if hasattr(adata_out.X, 'toarray'):
+        total_counts = np.array(adata_out.X.sum(axis=0)).flatten()
+    else:
+        total_counts = np.array(adata_out.X.sum(axis=0)).flatten()
+
+    adata_out.var['total_counts'] = total_counts
+    adata_out.var['percentile'] = adata_out.var['total_counts'].rank(pct=True)
+
+    if min_cutoff is not None:
+        threshold = np.quantile(total_counts, min_cutoff)
+        mask = total_counts > threshold  
+    elif n_top is not None:
+        if n_top >= len(total_counts):
+            return adata_out
+        threshold = np.sort(total_counts)[-n_top] 
+        mask = total_counts >= threshold
+    else:
+        raise ValueError("Please specify either min_cutoff or n_top.")
+
+    adata_out = adata_out[:, mask]
+
+    if inplace:
+        adata._inplace_subset_var(mask)
+        return None
+    else:
+        return adata_out
     
-def prepare_adata(adata_raw, n_features=3000, min_cells=None, min_genes=None, Modality="scRNA-seq"):
+def tfidf(X):
+    idf = np.log(X.shape[0] / X.sum(axis=0))
+    if sp.issparse(X):
+        tf = X.multiply(1 / X.sum(axis=1))
+        tfidf_matrix = tf.multiply(idf)
+        return tfidf_matrix.tocsr()
+    else:
+        tf = X / X.sum(axis=1, keepdims=True)
+        return sp.csr_matrix(tf * idf)
+    
+def select_features_by_tfidf_variance(adata, n_top=3000, min_cells=10):
+    if sp.issparse(adata.X):
+        X_bin = adata.X.copy()
+        X_bin.data = np.ones_like(X_bin.data)
+        cell_counts = np.array(X_bin.sum(axis=0)).flatten()
+    else:
+        X_bin = np.where(adata.X > 0, 1, 0)
+        cell_counts = X_bin.sum(axis=0)
+        
+    mask = cell_counts >= min_cells
+    adata_filtered = adata[:, mask].copy()
+    print(f"Peaks remaining after removing extreme noise (<{min_cells} cells): {adata_filtered.shape[1]}")
+    
+    if adata_filtered.shape[1] <= n_top:
+        return adata_filtered
+
+    X_for_tfidf = adata_filtered.X.copy()
+    if sp.issparse(X_for_tfidf):
+        X_for_tfidf.data = np.ones_like(X_for_tfidf.data)
+    else:
+        X_for_tfidf = np.where(X_for_tfidf > 0, 1, 0)
+
+    X_tfidf = tfidf(X_for_tfidf)
+    
+    mean_X = np.array(X_tfidf.mean(axis=0)).flatten()
+
+    X_tfidf_sq = X_tfidf.copy()
+    X_tfidf_sq.data **= 2
+    mean_X_sq = np.array(X_tfidf_sq.mean(axis=0)).flatten()
+
+    variances = mean_X_sq - (mean_X ** 2)
+
+    top_indices = np.argsort(variances)[-n_top:]
+    
+    print(f"Successfully selected top {n_top} features with highest TF-IDF variance.")
+    return adata_filtered[:, top_indices].copy()
+    
+def prepare_adata(
+        adata_raw, 
+        n_features=3000, 
+        min_cells=None, 
+        min_genes=None, 
+        Modality="scRNA-seq", 
+        hvg_flavor="seurat"
+        ):
+    assert Modality in ["scRNA-seq", "scATAC-seq"], "Unsupported Modality"
+
     adata = adata_raw.copy()
     adata.var_names = adata.var_names.astype(str)
     adata.var_names_make_unique()
@@ -239,19 +333,30 @@ def prepare_adata(adata_raw, n_features=3000, min_cells=None, min_genes=None, Mo
     if min_cells is not None:
         sc.pp.filter_genes(adata, min_cells=min_cells)
     adata.layers['counts'] = adata.X.copy()
+    
+    n = min(n_features, adata.X.shape[1])
+    
+    if Modality == "scATAC-seq":
+        adata = select_features_by_tfidf_variance(adata, n_top=n, min_cells=10)
+        #    adata.X = tfidf(adata.X)
+
     sc.pp.normalize_total(adata)
     if not is_logged(adata):
         print(f'performing log-transform for {Modality} Data.')
-        sc.pp.log1p(adata)
-    n = min(n_features, adata.X.shape[1])
-    print(f'finding top {n} highly variable features.')
-    sc.pp.highly_variable_genes(
-        adata,
-        flavor="seurat",
-        n_top_genes=n,
-        subset=True,
-        inplace=True,
-    )
+    else:
+        print(f'{Modality} Data seems has been log-transformed already. Still performing log-transform to ensure non-negativity.')
+    sc.pp.log1p(adata)
+    
+    if Modality == "scRNA-seq":
+        print(f'finding top {n} highly variable features.')
+        sc.pp.highly_variable_genes(
+            adata,
+            flavor=hvg_flavor,
+            n_top_genes=n,
+            subset=True,
+            inplace=True,
+        )
+
     return adata
 
 
@@ -288,3 +393,5 @@ def graph_positional_encoding(adj, k = 200, device='cpu'):
     lap_pe = eig_vecs[:, 1:]
     lap_pe = torch.from_numpy(lap_pe).float().to(device)
     return lap_pe
+
+

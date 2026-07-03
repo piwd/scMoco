@@ -209,7 +209,8 @@ class Model(nn.Module):
                 dropout=0., 
                 n_features_1=None, 
                 n_features_2=None,
-                gene2vec=True
+                gene2vec=False,
+                unpaired=False,
                 ):
         super().__init__()
         self.X1_dim = X1_dim
@@ -217,6 +218,7 @@ class Model(nn.Module):
         self.n_features_1 = n_features_1
         self.n_features_2 = n_features_2
         self.gene2vec = gene2vec
+        self.unpaired = unpaired
 
         if not gene2vec and exists(n_features_1):
             self.emb1 = nn.Embedding(n_features_1, in_dim)
@@ -226,6 +228,7 @@ class Model(nn.Module):
 
         self.gcn_1 = GCN(in_dim, hidden_dim, out_dim, dropout)
         self.gcn_2 = GCN(in_dim, hidden_dim, out_dim, dropout)
+
         self.cross_attention = BidirectionalCrossAttention(
             dim=out_dim,
             context_dim=out_dim,
@@ -233,14 +236,17 @@ class Model(nn.Module):
             dim_head=64,
             dropout=dropout
         )
-        self.attention = MultiHeadAttention(
-            out_dim, 
-            heads=8, 
-            dim_head=64, 
-            dropout=dropout
-        )
+        if self.unpaired:
+            self.attention = MultiHeadAttention(
+                out_dim, 
+                heads=8, 
+                dim_head=64, 
+                dropout=dropout
+            )
+        else:
+            self.alpha = nn.Parameter(torch.FloatTensor(out_dim, out_dim))
 
-        self.decoder = nn.Sequential(
+        self.decoder1 = nn.Sequential(
             nn.Linear(out_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim),
@@ -248,9 +254,19 @@ class Model(nn.Module):
             nn.ReLU(),
             nn.LayerNorm(hidden_dim * 2),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, X1_dim + X2_dim)
+            nn.Linear(hidden_dim * 2, X1_dim * 2)
         )
 
+        self.decoder2 = nn.Sequential(
+            nn.Linear(out_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, X2_dim * 2)
+        )
 
     def forward(self, 
                 X1, 
@@ -284,21 +300,48 @@ class Model(nn.Module):
         emb1 = torch.mm(X1, feat1)
         emb2 = torch.mm(X2, feat2)
 
-        emb = []
-        emb.append(torch.unsqueeze(torch.squeeze(emb1), dim=1))
-        emb.append(torch.unsqueeze(torch.squeeze(emb2), dim=1))
-        x = torch.cat(emb, dim=1)
+        if self.unpaired:
+            emb = []
+            emb.append(torch.unsqueeze(torch.squeeze(emb1), dim=1))
+            emb.append(torch.unsqueeze(torch.squeeze(emb2), dim=1))
+            x = torch.cat(emb, dim=1)
 
-        emb_combined, alpha = self.attention(x, bias=attn_bias)
-        emb_combined = emb_combined.reshape(emb_combined.shape[0], -1)
-        alpha = alpha.mean(dim=-2)
+            emb_combined, alpha = self.attention(x, bias=attn_bias)
+            emb_combined = emb_combined.reshape(emb_combined.shape[0], -1)
+            alpha = alpha.mean(dim=-2)
+        else:
+            emb_combined = self.alpha * emb1 + (1 - self.alpha) * emb2
+            alpha = self.alpha
         
-        x_recon = self.decoder(emb_combined)
-        x_recon = x_recon.split((self.X1_dim, self.X2_dim), dim=-1)
+        x_recon1 = self.decoder1(emb_combined)
+        x_recon1 = x_recon1.split((self.X1_dim, self.X1_dim), dim=-1)
 
-        loss = F.mse_loss(x_recon[0], X1) + F.mse_loss(x_recon[1], X2)
+        x_recon2 = self.decoder2(emb_combined)
+        x_recon2 = x_recon2.split((self.X2_dim, self.X2_dim), dim=-1)
+
+        loss = nb_loss(X1, x_recon1[0], x_recon1[1]) + nb_loss(X2, x_recon2[0], x_recon2[1])
         return {
             "embeddings": emb_combined,
             "attn_weights": alpha,
             "loss": loss
             }
+    
+def bernoulli_loss(y_true, logits, eps=1e-8):
+    y_pred = torch.sigmoid(logits)
+    y_pred = torch.clamp(y_pred, min=eps, max=1-eps)
+    loss = -torch.mean(torch.sum(
+        y_true * torch.log(y_pred) + (1 - y_true) * torch.log(1 - y_pred), 
+        dim=-1
+    ))
+    return loss
+
+def nb_loss(y_true, mu, theta, eps=1e-8):
+    mu = torch.clamp(mu, min=eps)
+    theta = torch.clamp(theta, min=eps)
+
+    t1 = torch.lgamma(y_true + theta) - torch.lgamma(y_true + 1) - torch.lgamma(theta)
+    t2 = theta * (torch.log(theta) - torch.log(theta + mu))
+    t3 = y_true * (torch.log(mu) - torch.log(theta + mu))
+    log_nb = t1 + t2 + t3
+
+    return -torch.mean(torch.sum(log_nb, dim=-1))

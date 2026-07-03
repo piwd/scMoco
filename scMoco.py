@@ -15,8 +15,12 @@ class Trainer:
                 *,
                 n_features_1=3000,
                 n_features_2=3000,
+                Modality_1="RNA",
+                Modality_2="ATAC",
+                hvg_flavor="seurat",
                 n_bins=None,
                 gene2vec=True,
+                unpaired=False,
                 random_seed=2025,
                 device='cpu',
                 lr=0.0001,
@@ -39,6 +43,7 @@ class Trainer:
         self.n_features_2 = n_features_2
         self.n_bins = n_bins
         self.gene2vec = gene2vec
+        self.unpaired = unpaired
         self.random_seed = random_seed
         self.device = device
         self.lr = lr
@@ -56,10 +61,10 @@ class Trainer:
 
         print('Preprocessing adata.\n---------------------------------')
         if gene2vec:
-            self.adata1, matched_idx = prepare_adata_for_gene2vec(adata_raw=self.adata1, n_features=n_features_1)
+            self.adata1, matched_idx = prepare_adata_for_gene2vec(adata_raw=self.adata1, n_features=n_features_1, hvg_flavor=hvg_flavor)
         else:
-            self.adata1 = prepare_adata(adata_raw=self.adata1, n_features=n_features_1, Modality="Modality_1")
-        self.adata2 = prepare_adata(adata_raw=self.adata2, n_features=n_features_2, Modality="Modality_2")
+            self.adata1 = prepare_adata(adata_raw=self.adata1, n_features=n_features_1, hvg_flavor=hvg_flavor, Modality=Modality_1)
+        self.adata2 = prepare_adata(adata_raw=self.adata2, n_features=n_features_2, hvg_flavor=hvg_flavor, Modality=Modality_2)
         
         print('Constructing and normalizing graph.\n---------------------------------')
         if exists(kwargs['out_dim']):
@@ -133,6 +138,7 @@ class Trainer:
             n_features_1=self.n_bins if exists(self.n_bins) else self.n_features_1,
             n_features_2=self.n_bins if exists(self.n_bins) else self.n_features_2,
             gene2vec=self.gene2vec,
+            unpaired = self.unpaired,
             **self.model_kwargs
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
